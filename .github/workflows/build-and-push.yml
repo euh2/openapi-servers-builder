@@ -1,0 +1,143 @@
+name: Build and Push OpenAPI Server Tools
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Check for updates daily at 6 AM UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: 'Force rebuild all images'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  REGISTRY: ghcr.io
+  # Change this to your GitHub username/organization
+  IMAGE_PREFIX: ${{ github.repository_owner }}/openapi-servers
+
+jobs:
+  discover:
+    name: Discover Available Tools
+    runs-on: ubuntu-latest
+    outputs:
+      tools: ${{ steps.discover.outputs.tools }}
+      tools_count: ${{ steps.discover.outputs.tools_count }}
+    steps:
+      - name: Checkout builder repository
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Discover tools
+        id: discover
+        run: |
+          tools=$(bash scripts/discover-tools.sh)
+          echo "tools=$tools" >> $GITHUB_OUTPUT
+          echo "tools_count=$(echo "$tools" | jq '. | length')" >> $GITHUB_OUTPUT
+          echo "Found $(echo "$tools" | jq '. | length') tools: $(echo "$tools" | jq -r '. | join(", ")')"
+
+  build:
+    name: Build ${{ matrix.tool }}
+    runs-on: ubuntu-latest
+    needs: discover
+    if: needs.discover.outputs.tools_count > 0
+    strategy:
+      fail-fast: false
+      matrix:
+        tool: ${{ fromJson(needs.discover.outputs.tools) }}
+    
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout upstream repository
+        uses: actions/checkout@v4
+        with:
+          repository: open-webui/openapi-servers
+          path: openapi-servers
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.tool }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=schedule,pattern={{date 'YYYYMMDD'}}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix={{branch}}-
+
+      - name: Check if Dockerfile exists
+        id: dockerfile_check
+        run: |
+          if [ -f "openapi-servers/servers/${{ matrix.tool }}/Dockerfile" ]; then
+            echo "dockerfile_exists=true" >> $GITHUB_OUTPUT
+            echo "✅ Dockerfile found for ${{ matrix.tool }}"
+          else
+            echo "dockerfile_exists=false" >> $GITHUB_OUTPUT
+            echo "❌ Dockerfile not found for ${{ matrix.tool }}"
+          fi
+
+      - name: Build and push Docker image
+        if: steps.dockerfile_check.outputs.dockerfile_exists == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: openapi-servers/servers/${{ matrix.tool }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Generate image summary
+        if: steps.dockerfile_check.outputs.dockerfile_exists == 'true'
+        run: |
+          echo "## 🐳 Built Image: ${{ matrix.tool }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Registry**: ${{ env.REGISTRY }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Repository**: ${{ env.IMAGE_PREFIX }}-${{ matrix.tool }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tags**: " >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" | sed 's/^/  - /' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+  summary:
+    name: Build Summary
+    runs-on: ubuntu-latest
+    needs: [discover, build]
+    if: always()
+    steps:
+      - name: Generate final summary
+        run: |
+          echo "# 🏗️ OpenAPI Servers Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tools discovered**: ${{ needs.discover.outputs.tools_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build trigger**: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Repository**: ${{ env.REGISTRY }}/${{ github.repository_owner }}/openapi-servers-*" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.build.result }}" = "success" ]; then
+            echo "✅ All builds completed successfully!" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.build.result }}" = "failure" ]; then
+            echo "❌ Some builds failed. Check the individual job logs." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Build status: ${{ needs.build.result }}" >> $GITHUB_STEP_SUMMARY
+          fi
